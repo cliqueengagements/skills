@@ -523,6 +523,371 @@ function unsignedInstruction(context: Context): JsonMap | null {
   };
 }
 
+/*
+ * Bitflow's own quote service, the one the Bitflow app uses.
+ *
+ * `plan` and `quote` used the SDK's `getQuoteForRoute`, which calls each pool's
+ * read-only quote function and never checks whether the call succeeded. Measured
+ * on 2026-09-11: for USDCx to USDh the pools answer `(err u1010)` and
+ * `(err u6014)` (ERR_QUOTE_B in router-stableswap-xyk-multihop-v-1-5), and the SDK
+ * returned those error codes AS the quote: 0.0000101 and 0.00006014 USDh for any
+ * input. The "at least" floor built from that protected nothing. The newest SDK
+ * (4.2.0) computes quotes with the same code.
+ *
+ * The quote service answers correctly (10 USDCx quoted 9.988 USDh through the
+ * HODLMM usdh/usdcx pool) and, from its quote, returns the swap call with typed
+ * arguments and post-conditions. Everything it returns is cross-checked below
+ * before it is handed on: nothing here signs or broadcasts.
+ */
+const QUOTE_SERVICE = "https://bff.bitflowapis.finance/api/quotes/v1";
+/** The router the service built every checked swap against, 2026-09-11. Any other contract is refused. */
+const DLMM_SWAP_ROUTER = "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-swap-router-v-1-1";
+const CONTRACT_ID = /^S[PM][0-9A-Z]{27,40}\.[a-zA-Z][a-zA-Z0-9_-]{0,127}$/;
+const DIGITS = /^\d+$/;
+
+/** An exact atomic amount in whole tokens, with no float in between: 989232733 at 8 places is 9.89232733. */
+function atomicToHuman(atomic: string, decimals: number): string {
+  const padded = atomic.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, padded.length - decimals).replace(/^0+(?=\d)/, "");
+  const frac = decimals > 0 ? padded.slice(-decimals).replace(/0+$/, "") : "";
+  return frac ? `${whole}.${frac}` : whole;
+}
+
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(DEFAULT_SDK_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new BlockedError("QUOTE_SERVICE_ERROR", `Bitflow's quote service returned HTTP ${response.status}.`, "Retry later.", { detail: text.slice(0, 180) });
+  }
+  return response.json() as Promise<T>;
+}
+
+/** The quote service's token list, with the decimals it quotes in. A row without whole decimals is refused. */
+async function serviceTokens(): Promise<TokenInfo[]> {
+  const response = await fetch(`${QUOTE_SERVICE}/tokens`, { signal: AbortSignal.timeout(DEFAULT_SDK_TIMEOUT_MS) });
+  if (!response.ok) throw new BlockedError("QUOTE_SERVICE_ERROR", `Bitflow's quote service returned HTTP ${response.status} for its token list.`, "Retry later.");
+  const body = (await response.json()) as { tokens?: any[] };
+  if (!Array.isArray(body.tokens)) throw new BlockedError("QUOTE_SERVICE_ERROR", "Bitflow's quote service returned no token list.", "Retry later.");
+  return body.tokens
+    .filter((t) => typeof t?.contract_address === "string" && CONTRACT_ID.test(t.contract_address))
+    .map((t) => ({
+      tokenId: String(t.contract_address),
+      symbol: String(t.symbol ?? t.contract_address),
+      name: String(t.name ?? t.symbol ?? t.contract_address),
+      tokenContract: String(t.contract_address),
+      tokenName: typeof t.asset_name === "string" && t.asset_name ? t.asset_name : null,
+      // No default. A missing figure would silently size the swap in the wrong unit.
+      tokenDecimals: Number.isInteger(t.decimals) && t.decimals >= 0 ? t.decimals : Number.NaN,
+    }));
+}
+
+/** Exact match only: the contract id, or the symbol. A symbol "usdh" must never find "susdh". */
+function resolveExact(tokens: TokenInfo[], selector: string | undefined, label: string): TokenInfo {
+  if (!selector) throw new Error(`${label} is required`);
+  const needle = selector.toLowerCase();
+  const matches = tokens.filter((t) => t.tokenContract?.toLowerCase() === needle || t.symbol.toLowerCase() === needle);
+  if (matches.length === 0) throw new BlockedError("TOKEN_NOT_FOUND", `Bitflow's quote service does not list ${label} ${selector}.`, "Use the token's contract id.", { selector });
+  if (matches.length > 1) throw new BlockedError("AMBIGUOUS_TOKEN", `More than one token matches ${label} ${selector}.`, "Use the token's contract id.", { selector });
+  const token = matches[0];
+  // STX is listed under Bitflow's wrapper contract with no real asset name
+  // ("unknown"); it leaves the wallet as native STX under an stx post-condition,
+  // so it needs no asset name. Every other token does.
+  if (!Number.isInteger(token.tokenDecimals) || (!token.tokenName && !isStx(token))) {
+    throw new BlockedError("TOKEN_METADATA", `Bitflow's quote service lists ${selector} without its decimals or asset name.`, "Report the token to Bitflow.");
+  }
+  return token;
+}
+
+interface ServiceQuote {
+  success?: boolean;
+  error?: unknown;
+  amount_out?: string;
+  min_amount_out?: string;
+  route_path?: string[];
+  execution_path?: unknown[];
+  input_token_decimals?: number;
+  output_token_decimals?: number;
+  execution_details?: Record<string, unknown>;
+}
+
+interface ServiceSwap {
+  success?: boolean;
+  error?: unknown;
+  swap_contract?: string;
+  function_name?: string;
+  swap_parameters_typed?: unknown[];
+  post_conditions?: any[];
+  total_hops?: number;
+}
+
+/**
+ * The best route through ONE pool holding both tokens, or a refusal.
+ *
+ * A swap goes through a single pool, never a chain (the SmartX owner's ruling,
+ * 11 September 2026). A chained route passes the in-between token through the
+ * wallet, pinned only by "the wallet sends at least 0", which leaves every unit
+ * of that token movable. The service's best route changes with the amount
+ * (sBTC to USDCx went direct at 2,000 sats and through STX at 5,000), so every
+ * route is asked for and the best single-pool one is taken. They come sorted
+ * best first.
+ */
+async function serviceQuote(tokenIn: TokenInfo, tokenOut: TokenInfo, amountAtomic: bigint, slippagePct: number): Promise<ServiceQuote> {
+  const multi = await postJson<{ success?: boolean; error?: unknown; routes?: ServiceQuote[] }>(`${QUOTE_SERVICE}/quote/multi`, {
+    input_token: tokenIn.tokenContract, output_token: tokenOut.tokenContract, amount_in: amountAtomic.toString(),
+    slippage_tolerance: slippagePct, allow_split: false,
+  });
+  if (multi.success !== true || multi.error || !Array.isArray(multi.routes)) {
+    throw new BlockedError("NO_ROUTE", "Bitflow's quote service found no route for this swap.", "Try a different token pair or amount.", { error: String(multi.error ?? "") });
+  }
+  // Single pool: in then out, every execution step naming the same pool (a real
+  // string), and no "empty swap" step. Measured: some two-token routes walk one
+  // pool's bins from an empty step and build a swap spending more than asked
+  // (5,001 for 5,000); they fail the amount check, so they are skipped here and
+  // the next single-pool route is used instead.
+  const single = multi.routes.filter((r) => Array.isArray(r?.route_path) && r.route_path.length === 2
+    && r.route_path[0] === tokenIn.tokenContract && r.route_path[1] === tokenOut.tokenContract
+    && Array.isArray(r.execution_path) && r.execution_path.length > 0
+    && r.execution_path.every((e: any) => typeof e?.pool_trait === "string" && e.pool_trait === (r.execution_path![0] as any).pool_trait && e?.is_empty_swap !== true)
+    && DIGITS.test(String(r.amount_out)));
+  // The most out, chosen here rather than trusting the service's order.
+  const quote = single.reduce<ServiceQuote | undefined>(
+    (best, r) => (best === undefined || BigInt(String(r.amount_out)) > BigInt(String(best.amount_out)) ? r : best), undefined);
+  if (!quote) {
+    throw new BlockedError(
+      "NO_SINGLE_POOL",
+      `Bitflow has no single pool between ${tokenIn.symbol} and ${tokenOut.symbol}, and swaps here go through one pool only.`,
+      "Choose two tokens that share a pool, or make two separate swaps.",
+      { routes: multi.routes.map((r) => (r?.route_path ?? []).join(" > ")) as Json },
+    );
+  }
+  if (!DIGITS.test(String(quote.amount_out)) || !DIGITS.test(String(quote.min_amount_out)) || BigInt(quote.min_amount_out!) <= 0n) {
+    throw new BlockedError("QUOTE_UNREADABLE", "Bitflow's quote gave no positive amount out.", "Retry later.");
+  }
+  if (quote.input_token_decimals !== tokenIn.tokenDecimals || quote.output_token_decimals !== tokenOut.tokenDecimals) {
+    throw new BlockedError("QUOTE_MISMATCH", "Bitflow's quote uses different decimals from its own token list.", "Retry later; report it if it persists.");
+  }
+  if (!Array.isArray(quote.execution_path) || quote.execution_path.length === 0) {
+    throw new BlockedError("NO_ROUTE", "Bitflow's quote came with no execution path.", "Try a different token pair or amount.");
+  }
+  return quote;
+}
+
+async function serviceSwap(quote: ServiceQuote, tokenIn: TokenInfo, tokenOut: TokenInfo, amountAtomic: bigint, slippagePct: number): Promise<ServiceSwap> {
+  const swap = await postJson<ServiceSwap>(`${QUOTE_SERVICE}/swap`, {
+    execution_path: quote.execution_path, amount_in: amountAtomic.toString(), amount_out: quote.amount_out,
+    input_token: tokenIn.tokenContract, output_token: tokenOut.tokenContract,
+    input_token_decimals: tokenIn.tokenDecimals, output_token_decimals: tokenOut.tokenDecimals, slippage_tolerance: slippagePct,
+  });
+  if (swap.success !== true || swap.error) {
+    throw new BlockedError("PREPARE_SWAP_FAILED", "Bitflow's quote service could not build the swap.", "Retry later.", { error: String(swap.error ?? "") });
+  }
+  // The only call shape verified against the router's interface on 2026-09-11:
+  // `swap-simple-multi` takes ONE argument, a list of swap tuples.
+  if (swap.function_name !== "swap-simple-multi" || typeof swap.swap_contract !== "string" || !CONTRACT_ID.test(swap.swap_contract)) {
+    throw new BlockedError("UNSUPPORTED_ROUTE", `Bitflow's quote service built a ${String(swap.function_name)} call, which plan does not express yet.`, "Report the route to the skill maintainer.");
+  }
+  if (!Array.isArray(swap.swap_parameters_typed) || swap.swap_parameters_typed.length === 0 || !Array.isArray(swap.post_conditions)) {
+    throw new BlockedError("PREPARE_SWAP_FAILED", "Bitflow's quote service returned an incomplete swap.", "Retry later.");
+  }
+  return swap;
+}
+
+/** The service's typed argument, as the JSON an external signer rebuilds. Unknown types refuse. */
+function serviceArgToJson(v: any): Json {
+  switch (v?.type) {
+    case "uint":
+      if (!DIGITS.test(String(v.value))) break;
+      return { type: "uint", value: String(v.value) };
+    case "int":
+      if (!/^-?\d+$/.test(String(v.value))) break;
+      return { type: "int", value: String(v.value) };
+    case "true": return { type: "bool", value: true };
+    case "false": return { type: "bool", value: false };
+    case "bool":
+      // Anything but a real boolean refuses: a garbled flag could flip a swap's direction.
+      if (v.value === true || v.value === "true") return { type: "bool", value: true };
+      if (v.value === false || v.value === "false") return { type: "bool", value: false };
+      break;
+    case "contract":
+    case "principal":
+      if (typeof v.value !== "string" || !CONTRACT_ID.test(v.value) && !/^S[PM][0-9A-Z]{27,40}$/.test(v.value)) break;
+      return { type: "principal", value: v.value };
+    case "tuple": {
+      if (!v.value || typeof v.value !== "object") break;
+      const fields: { [key: string]: Json } = {};
+      for (const [k, x] of Object.entries(v.value as Record<string, unknown>)) fields[k] = serviceArgToJson(x);
+      return { type: "tuple", value: fields };
+    }
+  }
+  throw new BlockedError("UNSUPPORTED_ARGUMENT", `Bitflow's quote service returned a ${String(v?.type)} argument plan cannot express.`, "Report the route to the skill maintainer.");
+}
+
+const CONDITION_CODES: Record<string, string> = {
+  less_than_or_equal_to: "lte", greater_than_or_equal_to: "gte", equal_to: "eq", less_than: "lt", greater_than: "gt",
+};
+
+/** The service's post-condition in the plan's JSON form. `tx-sender` is the wallet. Unknown shapes refuse. */
+function servicePcToJson(pc: any, wallet: string): JsonMap {
+  const principal = pc?.sender_address === "tx-sender" ? wallet : String(pc?.sender_address ?? "");
+  const conditionCode = CONDITION_CODES[String(pc?.condition_code)];
+  const amount = String(pc?.amount ?? "");
+  if (!conditionCode || !DIGITS.test(amount) || !(CONTRACT_ID.test(principal) || /^S[PM][0-9A-Z]{27,40}$/.test(principal))) {
+    throw new BlockedError("UNSUPPORTED_POSTCONDITION", "Bitflow's quote service returned a post-condition plan cannot express.", "Report the route to the skill maintainer.");
+  }
+  const kind = String(pc?.post_condition_type);
+  if (kind === "standard_stx" || kind === "contract_stx") return { type: "stx", principal, conditionCode, amount };
+  if (kind === "standard_fungible" || kind === "contract_fungible") {
+    const [asset, named] = String(pc.token_contract ?? "").split("::");
+    const assetName = /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(String(pc.token_asset_name ?? "")) ? String(pc.token_asset_name) : named;
+    if (!asset || !CONTRACT_ID.test(asset) || !assetName) {
+      throw new BlockedError("UNSUPPORTED_POSTCONDITION", "Bitflow's quote service returned a token post-condition without a readable asset.", "Report the route to the skill maintainer.");
+    }
+    return { type: "ft", principal, asset, assetName, conditionCode, amount };
+  }
+  throw new BlockedError("UNSUPPORTED_POSTCONDITION", `Bitflow's quote service returned a ${kind} post-condition plan cannot express.`, "Report the route to the skill maintainer.");
+}
+
+interface ServiceContext {
+  wallet: string;
+  tokenIn: TokenInfo;
+  tokenOut: TokenInfo;
+  amountHuman: string;
+  amountAtomic: bigint;
+  slippageBps: number;
+  quote: ServiceQuote;
+  swap: ServiceSwap;
+  balances: JsonMap;
+  safety: JsonMap;
+}
+
+async function buildServiceContext(opts: SharedOptions, withSwap: boolean): Promise<ServiceContext> {
+  if (NETWORK !== "mainnet") throw new BlockedError("MAINNET_ONLY", "bitflow-swap-aggregator is mainnet-only.", "Set NETWORK=mainnet.");
+  if (!opts.wallet) throw new Error("--wallet is required");
+  const tokens = await serviceTokens();
+  const tokenIn = resolveExact(tokens, opts.tokenIn, "--token-in");
+  const tokenOut = resolveExact(tokens, opts.tokenOut, "--token-out");
+  if (tokenIn.tokenContract === tokenOut.tokenContract) throw new BlockedError("SAME_TOKEN", "The input and output tokens are the same.", "Choose two different tokens.");
+  parsePositiveHuman(opts.amountIn, "--amount-in");
+  const amountHuman = opts.amountIn!;
+  const amountAtomic = decimalToAtomic(amountHuman, tokenIn.tokenDecimals);
+  if (amountAtomic <= 0n) throw new Error("--amount-in is required");
+  const slippageBps = parseBps(opts.slippageBps);
+  const slippagePct = slippageBps / 100;
+  const fee = parseNonNegativeBigInt(opts.feeUstx, DEFAULT_FEE_USTX, "--fee-ustx");
+  const minGasReserve = parseNonNegativeBigInt(opts.minGasReserveUstx, DEFAULT_MIN_GAS_RESERVE_USTX, "--min-gas-reserve-ustx");
+  const [quote, inputBalance, stxAvailable, pendingDepth] = await Promise.all([
+    serviceQuote(tokenIn, tokenOut, amountAtomic, slippagePct),
+    getFtBalance(opts.wallet, tokenIn),
+    getStxAvailable(opts.wallet),
+    getPendingDepth(opts.wallet),
+  ]);
+  if (withSwap && inputBalance < amountAtomic) {
+    throw new BlockedError("INSUFFICIENT_INPUT_BALANCE", "Wallet input balance is below the requested swap amount.", "Fund the wallet or reduce --amount-in.", { inputBalance, amountAtomic, tokenIn: tokenSummary(tokenIn) });
+  }
+  // STX pays the fee too, so swapping STX needs the amount AND the fee AND the reserve.
+  const stxNeeded = (isStx(tokenIn) ? amountAtomic : 0n) + fee + minGasReserve;
+  if (withSwap && stxAvailable < stxNeeded) {
+    throw new BlockedError("INSUFFICIENT_GAS_RESERVE", "Native STX cannot cover the swap, the fee and the residual gas reserve.", "Fund STX or reduce --amount-in.", { stxAvailable, fee, minGasReserve, stxNeeded });
+  }
+  const swap = withSwap ? await serviceSwap(quote, tokenIn, tokenOut, amountAtomic, slippagePct) : ({} as ServiceSwap);
+  return {
+    wallet: opts.wallet, tokenIn, tokenOut, amountHuman, amountAtomic, slippageBps, quote, swap,
+    balances: { inputBalance, stxAvailable },
+    safety: { pendingDepth, fee, minGasReserve },
+  };
+}
+
+function serviceQuoteData(ctx: ServiceContext): JsonMap {
+  return {
+    network: NETWORK,
+    wallet: ctx.wallet,
+    source: "Bitflow quote service",
+    tokens: { input: tokenSummary(ctx.tokenIn), output: tokenSummary(ctx.tokenOut) },
+    amount: { amountInHuman: ctx.amountHuman, amountInAtomic: ctx.amountAtomic, slippageBps: ctx.slippageBps },
+    quote: {
+      amountOut: ctx.quote.amount_out ?? null,
+      minAmountOut: ctx.quote.min_amount_out ?? null,
+      routePath: (ctx.quote.route_path ?? []) as Json,
+      details: stringify(ctx.quote.execution_details ?? null),
+    },
+    balances: ctx.balances,
+    safety: ctx.safety,
+  };
+}
+
+/**
+ * The service's swap as an unsigned call, after checking it says what was asked.
+ *
+ * Refused unless: the first step spends exactly the amount asked; the wallet's
+ * own condition caps that token at that amount; and a positive "at least"
+ * condition on the output token, from someone other than the wallet, matches the
+ * last step's `min-received`. Those are the numbers the person will read.
+ */
+function serviceInstruction(ctx: ServiceContext): JsonMap {
+  const steps = (ctx.swap.swap_parameters_typed ?? []).map(serviceArgToJson) as any[];
+  // One pool, so one swap tuple: true by construction, not by an argument about the router.
+  if (steps.length !== 1) {
+    throw new BlockedError("MULTI_STEP_ROUTE", "Bitflow's swap has more than one step, and swaps here go through one pool only.", "Retry; report it if it persists.");
+  }
+  const only = steps[0]?.value;
+  if (steps[0]?.type !== "tuple" || only?.amount?.value !== ctx.amountAtomic.toString()) {
+    throw new BlockedError("SWAP_MISMATCH", "Bitflow's swap does not spend the amount that was asked.", "Retry; report it if it persists.");
+  }
+  const last = only;
+  const postConditions = (ctx.swap.post_conditions ?? []).map((pc) => servicePcToJson(pc, ctx.wallet));
+  // STX has no asset id; it is keyed as "STX" on both sides.
+  const keyOf = (pc: JsonMap) => (pc.type === "stx" ? "STX" : `${pc.asset}::${pc.assetName}`);
+  const inAsset = isStx(ctx.tokenIn) ? "STX" : `${ctx.tokenIn.tokenContract}::${ctx.tokenIn.tokenName}`;
+  const delivers = isStx(ctx.tokenOut) ? "STX" : `${ctx.tokenOut.tokenContract}::${ctx.tokenOut.tokenName}`;
+  const cap = postConditions.find((pc) => pc.principal === ctx.wallet && keyOf(pc) === inAsset
+    && (pc.conditionCode === "lte" || pc.conditionCode === "eq") && pc.amount === ctx.amountAtomic.toString());
+  if (!cap) throw new BlockedError("SWAP_MISMATCH", "Bitflow's swap does not cap what leaves the wallet at the amount asked.", "Retry; report it if it persists.");
+  // The ONE cap is the only condition allowed on the wallet. A route through a
+  // second pool passes the in-between token through the wallet, and the service
+  // pins it with "the wallet sends at least 0", which under deny mode makes every
+  // unit of that token the wallet holds movable. Refused until such a leg can
+  // carry a real ceiling. Measured 2026-09-11: sBTC to USDh routes via USDCx.
+  if (postConditions.some((pc) => pc.principal === ctx.wallet && pc !== cap)) {
+    throw new BlockedError(
+      "MULTI_STEP_ROUTE",
+      `Bitflow's swap for ${ctx.tokenIn.symbol} to ${ctx.tokenOut.symbol} lets another token leave the wallet, so plan will not hand it on.`,
+      "Retry; report it if it persists.",
+      { routePath: (ctx.quote.route_path ?? []) as Json },
+    );
+  }
+  if (ctx.swap.swap_contract !== DLMM_SWAP_ROUTER) {
+    throw new BlockedError("UNSUPPORTED_ROUTE", `Bitflow's quote service built a call to ${String(ctx.swap.swap_contract)}, which plan does not know.`, "Report the route to the skill maintainer.");
+  }
+  const floors = postConditions.filter((pc) => pc.principal !== ctx.wallet && pc.conditionCode === "gte"
+    && keyOf(pc) === delivers && BigInt(String(pc.amount)) > 0n);
+  if (floors.length !== 1 || last?.["min-received"]?.value !== floors[0].amount) {
+    throw new BlockedError("SWAP_MISMATCH", "Bitflow's swap has no single positive 'at least' on the token received that matches its own minimum.", "Retry; report it if it persists.");
+  }
+  const least = atomicToHuman(String(floors[0].amount), ctx.tokenOut.tokenDecimals);
+  const [contractAddress, contractName] = String(ctx.swap.swap_contract).split(".");
+  return {
+    tool: "call_contract",
+    description: `Swap ${ctx.amountHuman} ${ctx.tokenIn.symbol} to at least ${least} ${ctx.tokenOut.symbol} via Bitflow`,
+    params: {
+      contractAddress,
+      contractName,
+      functionName: "swap-simple-multi",
+      functionArgs: [{ type: "list", value: steps }],
+      postConditionMode: "deny",
+      postConditions,
+      // Read what this delivered before doing anything with it: the amount that
+      // arrives can differ from the quote.
+      requires_residual_check: true,
+      delivers,
+    },
+  };
+}
+
 async function buildContext(opts: SharedOptions, requireAmount: boolean): Promise<Context> {
   if (NETWORK !== "mainnet") {
     throw new BlockedError("MAINNET_ONLY", "bitflow-swap-aggregator is mainnet-only.", "Set NETWORK=mainnet.");
@@ -795,21 +1160,9 @@ async function runTokens(opts: SharedOptions) {
 
 async function runQuote(opts: SharedOptions) {
   try {
-    const sdk = await createBitflowSdk();
-    const tokens = await getTokens(sdk);
-    const tokenIn = resolveTokenFromList(tokens, opts.tokenIn, "--token-in");
-    const tokenOut = resolveTokenFromList(tokens, opts.tokenOut, "--token-out");
-    const amountHuman = parsePositiveHuman(opts.amountIn, "--amount-in");
-    const quote = await sdkCall("getQuoteForRoute", () => sdk.getQuoteForRoute(tokenIn.tokenId, tokenOut.tokenId, amountHuman));
-    if (!quote?.bestRoute?.route) {
-      throw new BlockedError("NO_ROUTE", "Bitflow aggregator did not return an executable route.", "Try a different token pair or amount.", { tokenIn: tokenIn.tokenId, tokenOut: tokenOut.tokenId, amountIn: amountHuman });
-    }
-    success("quote", {
-      network: NETWORK,
-      tokens: { input: tokenSummary(tokenIn), output: tokenSummary(tokenOut) },
-      amountInHuman: amountHuman,
-      quote: routeSummary(quote),
-    });
+    // Bitflow's quote service, not the SDK's route quote: see QUOTE_SERVICE.
+    const context = await buildServiceContext(opts, false);
+    success("quote", serviceQuoteData(context));
   } catch (error) {
     fail("quote", error);
   }
@@ -817,9 +1170,10 @@ async function runQuote(opts: SharedOptions) {
 
 async function runPlan(opts: SharedOptions) {
   try {
-    const context = await buildContext(opts, true);
-    const instruction = unsignedInstruction(context);
-    success("plan", { ...contextData(context), instructions: instruction ? [instruction] : [] });
+    // Bitflow's quote service builds the swap; this checks it and hands it on
+    // unsigned. Nothing here signs or broadcasts.
+    const context = await buildServiceContext(opts, true);
+    success("plan", { ...serviceQuoteData(context), instructions: [serviceInstruction(context)] });
   } catch (error) {
     fail("plan", error);
   }

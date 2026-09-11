@@ -444,6 +444,85 @@ function postconditionSummary(postConditions: unknown[]): Json[] {
   });
 }
 
+/**
+ * The prepared swap as an UNSIGNED contract call, for a wallet other than this
+ * skill's to sign.
+ *
+ * `plan` used to print only a summary of the prepared swap: the function
+ * arguments were dropped and the post-conditions were read with field names the
+ * installed @stacks/transactions does not use, so every one came out as
+ * "unknown". An agent that never holds the person's key (SmartX) could see the
+ * route but could not hand the person the exact transaction to sign. This emits
+ * the same call `run` would sign, in a JSON form such an agent can rebuild
+ * exactly: typed Clarity arguments and explicit post-conditions, deny mode.
+ * Nothing here signs or broadcasts.
+ */
+function clarityToJson(cv: any): Json {
+  switch (cv?.type) {
+    case "uint": return { type: "uint", value: String(cv.value) };
+    case "int": return { type: "int", value: String(cv.value) };
+    case "true": return { type: "bool", value: true };
+    case "false": return { type: "bool", value: false };
+    case "address":
+    case "contract": return { type: "principal", value: String(cv.value) };
+    case "none": return { type: "none" };
+    case "some": return { type: "some", value: clarityToJson(cv.value) };
+    case "list": return { type: "list", value: (cv.value as unknown[]).map(clarityToJson) };
+    case "tuple": {
+      const fields: { [key: string]: Json } = {};
+      for (const [k, v] of Object.entries(cv.value as Record<string, unknown>)) fields[k] = clarityToJson(v);
+      return { type: "tuple", value: fields };
+    }
+    case "buffer": return { type: "buffer", value: String(cv.value) };
+    case "ascii": return { type: "string-ascii", value: String(cv.value) };
+    case "utf8": return { type: "string-utf8", value: String(cv.value) };
+    default:
+      throw new BlockedError("UNSUPPORTED_ARGUMENT", `The prepared swap has a ${String(cv?.type)} argument that cannot be expressed for an external signer.`, "Report the route to the skill maintainer.");
+  }
+}
+
+function postConditionToJson(pc: any): Json {
+  if (pc?.type === "stx-postcondition") {
+    return { type: "stx", principal: String(pc.address), conditionCode: String(pc.condition), amount: String(pc.amount) };
+  }
+  if (pc?.type === "ft-postcondition") {
+    const [asset, assetName] = String(pc.asset).split("::");
+    return { type: "ft", principal: String(pc.address), asset: asset ?? "", assetName: assetName ?? "", conditionCode: String(pc.condition), amount: String(pc.amount) };
+  }
+  throw new BlockedError("UNSUPPORTED_POSTCONDITION", `The prepared swap has a ${String(pc?.type)} post-condition that cannot be expressed for an external signer.`, "Report the route to the skill maintainer.");
+}
+
+function tokenAssetId(token: TokenInfo): string {
+  return isStx(token) ? "STX" : `${token.tokenContract}::${token.tokenName}`;
+}
+
+function unsignedInstruction(context: Context): JsonMap | null {
+  const p = context.swapParams;
+  if (!p) return null;
+  const postConditions = p.postConditions.map(postConditionToJson) as JsonMap[];
+  const delivers = tokenAssetId(context.tokenOut);
+  // The least the person receives: the one "at least" condition on the output token.
+  const floors = postConditions.filter((pc) => pc.conditionCode === "gte" && (pc.type === "ft" ? `${pc.asset}::${pc.assetName}` : "STX") === delivers);
+  const least = floors.length === 1 ? Number(floors[0].amount) / 10 ** context.tokenOut.tokenDecimals : null;
+  const path = (context.quote?.bestRoute?.tokenPath ?? []).join(" > ");
+  return {
+    tool: "call_contract",
+    description: `Swap ${context.amountHuman} ${context.tokenIn.symbol} to ${least === null ? "" : `at least ${least} `}${context.tokenOut.symbol} via Bitflow${path ? ` (${path})` : ""}`,
+    params: {
+      contractAddress: p.contractAddress,
+      contractName: p.contractName,
+      functionName: p.functionName,
+      functionArgs: p.functionArgs.map(clarityToJson),
+      postConditionMode: "deny",
+      postConditions,
+      // Read what this delivered before doing anything with it: the amount that
+      // arrives can differ from the quote.
+      requires_residual_check: true,
+      delivers,
+    },
+  };
+}
+
 async function buildContext(opts: SharedOptions, requireAmount: boolean): Promise<Context> {
   if (NETWORK !== "mainnet") {
     throw new BlockedError("MAINNET_ONLY", "bitflow-swap-aggregator is mainnet-only.", "Set NETWORK=mainnet.");
@@ -739,7 +818,8 @@ async function runQuote(opts: SharedOptions) {
 async function runPlan(opts: SharedOptions) {
   try {
     const context = await buildContext(opts, true);
-    success("plan", contextData(context));
+    const instruction = unsignedInstruction(context);
+    success("plan", { ...contextData(context), instructions: instruction ? [instruction] : [] });
   } catch (error) {
     fail("plan", error);
   }

@@ -60,6 +60,8 @@ bun run bitflow-swap-aggregator/bitflow-swap-aggregator.ts quote --token-in toke
 
 Prepares the executable swap call and reports the contract/function, route, postconditions, balances, and safety gates without broadcasting.
 
+It also returns `data.instructions`: the same call `run` would sign, as an unsigned `call_contract` instruction with typed Clarity arguments and explicit deny mode post-conditions, so an agent that never holds the wallet's key can hand the owner the exact transaction to sign in their own wallet.
+
 ```bash
 bun run bitflow-swap-aggregator/bitflow-swap-aggregator.ts plan --wallet <stacks-address> --token-in token-stx --token-out token-USDCx-auto --amount-in 1
 ```
